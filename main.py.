@@ -1,0 +1,232 @@
+import os
+import logging
+import re
+import threading
+import pandas as pd
+from io import BytesIO, TextIOWrapper
+from flask import Flask
+from telegram import Update
+from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters
+
+# ========== FLASK (для пинга и чтобы Render не засыпал) ==========
+app = Flask(__name__)
+
+@app.route('/')
+def home():
+    return "WB Bot is running!"
+
+def run_flask():
+    port = int(os.environ.get("PORT", 10000))
+    app.run(host='0.0.0.0', port=port)
+
+# ========== НАСТРОЙКИ ==========
+logging.basicConfig(format="%(asctime)s - %(levelname)s - %(message)s", level=logging.INFO)
+TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
+if not TOKEN:
+    raise ValueError("Добавь TELEGRAM_BOT_TOKEN в Environment Variables")
+
+# ========== ПАРСЕРЫ ==========
+def parse_excel(file_bytes):
+    result = {}
+    try:
+        xls = pd.ExcelFile(BytesIO(file_bytes))
+        for sheet in xls.sheet_names:
+            df = pd.read_excel(xls, sheet_name=sheet)
+            df = df.where(pd.notnull(df), None)
+            result[sheet] = df.to_dict(orient="records")
+            result[f"_{sheet}_cols"] = df.columns.tolist()
+    except Exception as e:
+        result["error"] = str(e)
+    return result
+
+def parse_csv(file_bytes):
+    result = {}
+    try:
+        for enc in ["utf-8-sig", "cp1251", "utf-8"]:
+            try:
+                text = file_bytes.decode(enc)
+                break
+            except UnicodeDecodeError:
+                continue
+        else:
+            raise ValueError("Кодировка не определена")
+        sep = max([",", ";", "\t", "|"], key=lambda s: text[:2000].count(s))
+        df = pd.read_csv(TextIOWrapper(BytesIO(file_bytes), encoding=enc), delimiter=sep, low_memory=False)
+        df = df.where(pd.notnull(df), None)
+        result["data"] = df.to_dict(orient="records")
+        result["_columns"] = df.columns.tolist()
+    except Exception as e:
+        result["error"] = str(e)
+    return result
+
+def parse_pdf(file_bytes):
+    try:
+        from PyPDF2 import PdfReader
+        reader = PdfReader(BytesIO(file_bytes))
+        full_text = ""
+        for page in reader.pages:
+            full_text += (page.extract_text() or "") + "\n"
+        return {"text": full_text}
+    except Exception as e:
+        return {"error": str(e), "text": ""}
+
+def parse_text(file_bytes):
+    try:
+        for enc in ["utf-8-sig", "cp1251", "utf-8"]:
+            try:
+                return {"text": file_bytes.decode(enc)}
+            except UnicodeDecodeError:
+                continue
+    except Exception as e:
+        return {"error": str(e), "text": ""}
+
+# ========== ИЗВЛЕЧЕНИЕ WB-ДАННЫХ ==========
+def extract_wb_metrics(raw_data, source_type):
+    metrics = {
+        "type": "Не определён",
+        "rows": 0,
+        "sheets": [],
+        "columns": [],
+        "sales_sum": 0,
+        "revenue_sum": 0,
+        "commission_sum": 0,
+        "logistics_sum": 0,
+        "returns_sum": 0,
+        "penalties_sum": 0,
+        "nm_ids": [],
+    }
+    all_rows = []
+    if source_type == "excel":
+        for k, v in raw_data.items():
+            if not k.startswith("_") and isinstance(v, list):
+                metrics["sheets"].append(k)
+                metrics["rows"] += len(v)
+                all_rows.extend(v)
+        cols = []
+        for k, v in raw_data.items():
+            if k.endswith("_cols"):
+                cols.extend(v)
+        metrics["columns"] = list(set(cols))
+    elif source_type == "csv":
+        all_rows = raw_data.get("data", [])
+        metrics["rows"] = len(all_rows)
+        metrics["columns"] = raw_data.get("_columns", [])
+    elif source_type in ("pdf", "text"):
+        text = raw_data.get("text", raw_data.get("full_text", ""))
+        metrics["nm_ids"] = list(set(re.findall(r'\b\d{8,14}\b', text)))
+        tlow = text.lower()
+        if any(w in tlow for w in ["продажа", "выкуп", "sales"]):
+            metrics["type"] = "Отчёт о продажах"
+        elif any(w in tlow for w in ["остаток", "stock", "склад"]):
+            metrics["type"] = "Отчёт по остаткам"
+        return metrics
+
+    cols_str = " ".join(metrics["columns"]).lower()
+    if any(w in cols_str for w in ["продажа", "выкуп", "sales", "заказ"]):
+        metrics["type"] = "Отчёт о продажах"
+    elif any(w in cols_str for w in ["остаток", "stock", "склад", "balance"]):
+        metrics["type"] = "Отчёт по остаткам"
+    elif any(w in cols_str for w in ["перечислени", "выручка", "revenue", "payment"]):
+        metrics["type"] = "Финансовый отчёт"
+    elif any(w in cols_str for w in ["логистика", "доставка", "logistics"]):
+        metrics["type"] = "Отчёт по логистике"
+
+    keyword_map = {
+        "sales_sum": ["продажа", "выкуп", "заказ", "sales", "orders", "quantity", "количество"],
+        "revenue_sum": ["выручка", "перечисление", "revenue", "payment", "total", "к перечислению"],
+        "commission_sum": ["комиссия", "commission", "fee"],
+        "logistics_sum": ["логистика", "доставка", "logistics", "delivery"],
+        "returns_sum": ["возврат", "returns", "return_amount"],
+        "penalties_sum": ["штраф", "penalties", "deduction", "fine"],
+    }
+    for row in all_rows:
+        for col, val in row.items():
+            col_low = str(col).lower()
+            for metric, keys in keyword_map.items():
+                if any(k in col_low for k in keys):
+                    try:
+                        clean = str(val).replace(" ", "").replace("₽", "").replace("р.", "").replace(",", ".")
+                        if clean and clean != "None":
+                            num = float(clean)
+                            metrics[metric] += num
+                    except (ValueError, TypeError):
+                        pass
+    for row in all_rows:
+        for val in row.values():
+            if isinstance(val, (int, float)) and 10000000 <= int(val) <= 999999999999:
+                metrics["nm_ids"].append(str(int(val)))
+            elif isinstance(val, str) and val.isdigit() and 8 <= len(val) <= 14:
+                metrics["nm_ids"].append(val)
+    metrics["nm_ids"] = list(set(metrics["nm_ids"]))[:30]
+    return metrics
+
+# ========== ФОРМАТИРОВАНИЕ ==========
+def format_report(metrics, filename):
+    lines = [
+        f"📄 <b>{filename}</b>",
+        f"📊 Тип: <code>{metrics['type']}</code>",
+        f"📋 Строк: {metrics['rows']}",
+    ]
+    if metrics["sheets"]:
+        lines.append(f"📑 Листов: {len(metrics['sheets'])}")
+    nums = []
+    if metrics["sales_sum"]: nums.append(f"🛒 Продажи: <b>{metrics['sales_sum']:,.2f}</b> ₽")
+    if metrics["revenue_sum"]: nums.append(f"💵 Выручка: <b>{metrics['revenue_sum']:,.2f}</b> ₽")
+    if metrics["commission_sum"]: nums.append(f"📉 Комиссия: <b>{metrics['commission_sum']:,.2f}</b> ₽")
+    if metrics["logistics_sum"]: nums.append(f"🚚 Логистика: <b>{metrics['logistics_sum']:,.2f}</b> ₽")
+    if metrics["returns_sum"]: nums.append(f"↩️ Возвраты: <b>{metrics['returns_sum']:,.2f}</b> ₽")
+    if metrics["penalties_sum"]: nums.append(f"⚠️ Штрафы: <b>{metrics['penalties_sum']:,.2f}</b> ₽")
+    if nums:
+        lines.append("\n💰 <b>Показатели:</b>")
+        lines.extend(nums)
+    if metrics["nm_ids"]:
+        lines.append(f"\n🏷 Артикулы: {', '.join(metrics['nm_ids'])}")
+    if metrics["columns"]:
+        lines.append(f"\n📌 Колонки: {', '.join(metrics['columns'][:10])}" + ("..." if len(metrics['columns']) > 10 else ""))
+    return "\n".join(lines)
+
+# ========== TELEGRAM HANDLERS ==========
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "👋 Отправь мне отчёт WB (Excel, CSV, PDF, TXT).\nЯ извлеку: продажи, выручку, комиссии, логистику, артикулы.",
+        parse_mode="HTML"
+    )
+
+async def process_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    doc = update.message.document
+    fname = doc.file_name.lower()
+    if not fname.endswith((".xlsx", ".xls", ".csv", ".pdf", ".txt")):
+        await update.message.reply_text("❌ Формат не поддерживается. Отправь .xlsx, .csv, .pdf или .txt")
+        return
+    msg = await update.message.reply_text("⏳ Скачиваю...")
+    file = await context.bot.get_file(doc.file_id)
+    fbytes = await file.download_as_bytearray()
+    await msg.edit_text("🔍 Анализирую...")
+    if fname.endswith((".xlsx", ".xls")):
+        raw = parse_excel(bytes(fbytes))
+        stype = "excel"
+    elif fname.endswith(".csv"):
+        raw = parse_csv(bytes(fbytes))
+        stype = "csv"
+    elif fname.endswith(".pdf"):
+        raw = parse_pdf(bytes(fbytes))
+        stype = "pdf"
+    else:
+        raw = parse_text(bytes(fbytes))
+        stype = "text"
+    if raw.get("error"):
+        await msg.edit_text(f"❌ Ошибка: {raw['error']}")
+        return
+    metrics = extract_wb_metrics(raw, stype)
+    report = format_report(metrics, doc.file_name)
+    await msg.delete()
+    await update.message.reply_text(report, parse_mode="HTML")
+
+# ========== ЗАПУСК ==========
+if __name__ == "__main__":
+    threading.Thread(target=run_flask, daemon=True).start()
+    application = Application.builder().token(TOKEN).build()
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(MessageHandler(filters.Document.ALL, process_file))
+    logging.info("Бот запущен...")
+    application.run_polling()
