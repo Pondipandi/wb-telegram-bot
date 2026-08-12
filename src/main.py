@@ -230,4 +230,4 @@ if __name__ == "__main__":
     application.add_handler(MessageHandler(filters.Document.ALL, process_file))
     logging.info("Бот запущен...")
     application.run_polling()
-  move main.py to src
+  #move main.py to src
